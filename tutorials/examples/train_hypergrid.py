@@ -51,7 +51,9 @@ from gfn.gflownet import (
     ModifiedDBGFlowNet,
     SubTBGFlowNet,
     TBGFlowNet,
+    WassersteinGFlowNet,
 )
+from gfn.gflownet.wasserstein import WassersteinLossConfig
 from gfn.gym import HyperGrid
 from gfn.preprocessors import KHotPreprocessor
 from gfn.states import DiscreteStates
@@ -234,6 +236,19 @@ def _make_optimizer_for(gflownet, args) -> torch.optim.Optimizer:
     )
 
 
+def _make_wasserstein_critic_optimizer(
+    gflownet: GFlowNet, args
+) -> torch.optim.Optimizer | None:
+    if not isinstance(gflownet, WassersteinGFlowNet):
+        return None
+
+    params = gflownet.critic_parameters()
+    if len(params) == 0:
+        return None
+
+    return torch.optim.Adam(params, lr=args.wasserstein_critic_lr)
+
+
 def set_up_fm_gflownet(args, env, preprocessor, agent_group_list, my_agent_group_id):
     """Returns a FM GFlowNet."""
     # We need a LogEdgeFlowEstimator.
@@ -336,6 +351,22 @@ def set_up_logF_estimator(
     return ScalarEstimator(module=module, preprocessor=preprocessor)
 
 
+def set_up_wasserstein_critic(
+    args, env, preprocessor
+) -> ScalarEstimator:
+    if args.tabular:
+        module = Tabular(n_states=env.n_states, output_dim=1)
+    else:
+        module = MLP(
+            input_dim=preprocessor.output_dim,
+            output_dim=1,
+            hidden_dim=args.hidden_dim,
+            n_hidden_layers=args.n_hidden,
+        )
+
+    return ScalarEstimator(module=module, preprocessor=preprocessor)
+
+
 def set_up_gflownet(args, env, preprocessor, agent_group_list, my_agent_group_id):
     """Returns a GFlowNet complete with the required estimators."""
     # Initialize per-agent exploration strategy.
@@ -394,6 +425,22 @@ def set_up_gflownet(args, env, preprocessor, agent_group_list, my_agent_group_id
 
         elif args.loss == "ZVar":
             return LogPartitionVarianceGFlowNet(pf=pf_estimator, pb=pb_estimator)
+
+        elif args.loss == "Wasserstein":
+            critic_estimator = set_up_wasserstein_critic(
+                args,
+                env,
+                preprocessor,
+            )
+            config = WassersteinLossConfig(
+                gradient_penalty_coef=args.wasserstein_gradient_penalty
+            )
+            return WassersteinGFlowNet(
+                pf=pf_estimator,
+                pb=pb_estimator,
+                critic=critic_estimator,
+                config=config,
+            )
 
         elif args.loss in ("DB", "SubTB"):
             # We also need a LogStateFlowEstimator.
@@ -716,9 +763,9 @@ def main(args):  # noqa: C901
                 training_objects = training_samples
 
         # Loss.
+        critic_loss_value: float | None = None
         with Timer(timing, "calculate_loss", enabled=args.timing) as loss_timer:
 
-            optimizer.zero_grad()
             # Recompute whether we are off-policy for loss logprob recalculation.
             is_on_policy_iter = (
                 (args.replay_buffer_size == 0)
@@ -726,12 +773,47 @@ def main(args):  # noqa: C901
                 and (float(getattr(args, "agent_temperature", 1.0)) == 1.0)
                 and (int(getattr(args, "agent_n_noisy_layers", 0)) == 0)
             )
-            loss = gflownet.loss(
-                env,
-                training_objects,  # type: ignore
-                recalculate_all_logprobs=(not is_on_policy_iter),
-                reduction="sum" if args.distributed or args.loss == "SubTB" else "mean",  # type: ignore
-            )
+
+            if args.loss == "Wasserstein":
+                assert (
+                    critic_optimizer is not None
+                ), "Critic optimizer must be initialized"
+                critic_loss_accum = 0.0
+                for _ in range(args.wasserstein_critic_steps):
+                    critic_optimizer.zero_grad()
+                    critic_loss = gflownet.critic_loss(
+                        env,
+                        training_objects,  # type: ignore
+                        recalculate_all_logprobs=(not is_on_policy_iter),
+                    )
+                    if args.distributed:
+                        critic_loss = critic_loss / (per_node_batch_size)
+
+                    critic_loss.backward()
+                    critic_optimizer.step()
+                    critic_loss_accum += critic_loss.detach().item()
+
+                critic_loss_value = critic_loss_accum / max(
+                    1, args.wasserstein_critic_steps
+                )
+
+                optimizer.zero_grad()
+                loss = gflownet.loss(
+                    env,
+                    training_objects,  # type: ignore
+                    recalculate_all_logprobs=(not is_on_policy_iter),
+                )
+            else:
+                optimizer.zero_grad()
+                reduction = (
+                    "sum" if args.distributed or args.loss == "SubTB" else "mean"
+                )
+                loss = gflownet.loss(
+                    env,
+                    training_objects,  # type: ignore
+                    recalculate_all_logprobs=(not is_on_policy_iter),
+                    reduction=reduction,  # type: ignore[arg-type]
+                )
 
             # Normalize the loss by the local batch size if distributed.
             if args.distributed:
@@ -808,6 +890,7 @@ def main(args):  # noqa: C901
 
                 to_log = {
                     "loss": loss.item(),
+                    "critic_loss": critic_loss_value,
                     "sample_time": sample_timer.elapsed,
                     "to_train_samples_time": to_train_samples_timer.elapsed,
                     "loss_time": loss_timer.elapsed,
@@ -1058,7 +1141,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--loss",
         type=str,
-        choices=["FM", "TB", "DB", "SubTB", "ZVar", "ModifiedDB"],
+        choices=["FM", "TB", "DB", "SubTB", "ZVar", "ModifiedDB", "Wasserstein"],
         default="TB",
         help="Loss function to use",
     )
@@ -1070,6 +1153,24 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--subTB_lambda", type=float, default=0.9, help="Lambda parameter for SubTB"
+    )
+    parser.add_argument(
+        "--wasserstein_gradient_penalty",
+        type=float,
+        default=10.0,
+        help="Gradient penalty coefficient used by the Wasserstein loss",
+    )
+    parser.add_argument(
+        "--wasserstein_critic_steps",
+        type=int,
+        default=5,
+        help="Number of critic updates per generator update for the Wasserstein loss",
+    )
+    parser.add_argument(
+        "--wasserstein_critic_lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for the Wasserstein critic optimizer",
     )
 
     parser.add_argument(
